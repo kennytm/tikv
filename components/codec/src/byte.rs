@@ -1298,16 +1298,11 @@ mod benches {
                 return Err(Error::eof());
             };
 
-            unsafe {
-                // it is semantically equivalent to C's memmove()
-                // and the src and dest may overlap
-                // if src == dest do nothing
-                std::ptr::copy(
-                    data.as_ptr().add(read_offset),
-                    data.as_mut_ptr().add(write_offset),
-                    ENC_GROUP_SIZE,
-                );
-            }
+            // it is semantically equivalent to C's memmove()
+            // and the src and dest may overlap
+            // if src == dest do nothing
+            data.copy_within(read_offset..(read_offset + ENC_GROUP_SIZE), write_offset);
+
             write_offset += ENC_GROUP_SIZE;
             // everytime make ENC_GROUP_SIZE + 1 elements as a decode unit
             read_offset += ENC_GROUP_SIZE + 1;
@@ -1334,9 +1329,7 @@ mod benches {
                 if &data[write_offset - pad_size..write_offset] != padding_slice {
                     return Err(Error::bad_padding());
                 }
-                unsafe {
-                    data.set_len(write_offset - pad_size);
-                }
+                data.truncate(write_offset - pad_size);
                 if desc {
                     for k in data {
                         *k = !*k;
