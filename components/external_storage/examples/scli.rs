@@ -140,7 +140,7 @@ fn process() -> Result<()> {
         }
         Some("load") => {
             let mut file = AllowStdIo::new(File::create(file_path)?);
-            let reader = storage.read(name)?;
+            let reader = storage.read(name);
             block_on(copy(reader, &mut file))?;
         }
         _ => return Err(Error::new(ErrorKind::Other, "subcommand unrecognized")),

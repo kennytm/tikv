@@ -2,11 +2,8 @@
 
 use std::io::{Error, ErrorKind, Result};
 
-use futures01::stream::Stream;
 use futures_io::AsyncRead;
-use futures_util::compat::AsyncRead01CompatExt;
-use futures_util::io::AsyncReadExt;
-use tokio::codec::{BytesCodec, FramedRead};
+use futures_util::{future::FutureExt, stream::TryStreamExt};
 
 use rusoto_core::region;
 use rusoto_core::request::DispatchSignedRequest;
@@ -15,8 +12,13 @@ use rusoto_core::{ByteStream, RusotoError};
 use rusoto_credential::{DefaultCredentialsProvider, StaticProvider};
 use rusoto_s3::*;
 
-use super::ExternalStorage;
+use super::{
+    util::{block_on_with_tokio, error_stream, AsyncReadAsSyncStreamOfBytes},
+    ExternalStorage,
+};
 use kvproto::backup::S3 as Config;
+
+const READ_BUF_SIZE: usize = 1024 * 1024 * 2;
 
 /// S3 compatible storage
 #[derive(Clone)]
@@ -32,7 +34,7 @@ impl S3Storage {
         // than 100MB. See https://github.com/rusoto/rusoto/pull/1227
         // for more information.
         let mut http_config = HttpConfig::new();
-        http_config.read_buf_size(1024 * 1024 * 2);
+        http_config.read_buf_size(READ_BUF_SIZE);
         let http_dispatcher = HttpClient::new_with_config(http_config).unwrap();
 
         S3Storage::with_request_dispatcher(config, http_dispatcher)
@@ -41,7 +43,6 @@ impl S3Storage {
     fn with_request_dispatcher<D>(config: &Config, dispatcher: D) -> Result<S3Storage>
     where
         D: DispatchSignedRequest + Send + Sync + 'static,
-        D::Future: Send,
     {
         if config.bucket.is_empty() {
             return Err(Error::new(ErrorKind::InvalidInput, "missing bucket name"));
@@ -110,7 +111,7 @@ impl ExternalStorage for S3Storage {
             key,
             bucket: self.config.bucket.clone(),
             body: Some(ByteStream::new(
-                FramedRead::new(reader.compat(), BytesCodec::new()).map(|bytes| bytes.freeze()),
+                AsyncReadAsSyncStreamOfBytes::with_capacity(reader, READ_BUF_SIZE),
             )),
             content_length: Some(content_length as i64),
             acl: get_var(&self.config.acl),
@@ -118,38 +119,47 @@ impl ExternalStorage for S3Storage {
             storage_class: get_var(&self.config.storage_class),
             ..Default::default()
         };
-        self.client
-            .put_object(req)
-            .sync()
+        block_on_with_tokio(self.client.put_object(req))
             .map(|_| ())
             .map_err(|e| Error::new(ErrorKind::Other, format!("failed to put object {}", e)))
     }
 
-    fn read(&self, name: &str) -> Result<Box<dyn AsyncRead + Unpin>> {
+    fn read(&self, name: &str) -> Box<dyn AsyncRead + Unpin + '_> {
         let key = self.maybe_prefix_key(name);
         debug!("read file from s3 storage"; "key" => %key);
+        let bucket = self.config.bucket.clone();
         let req = GetObjectRequest {
             key,
-            bucket: self.config.bucket.clone(),
+            bucket: bucket.clone(),
             ..Default::default()
         };
-        self.client
-            .get_object(req)
-            .sync()
-            .map(|out| Box::new(out.body.unwrap().into_async_read().compat()) as _)
-            .map_err(|e| match e {
-                RusotoError::Service(GetObjectError::NoSuchKey(key)) => Error::new(
-                    ErrorKind::NotFound,
-                    format!("not key {} not at bucket {}", key, self.config.bucket),
-                ),
-                e => Error::new(ErrorKind::Other, format!("failed to get object {}", e)),
-            })
+
+        Box::new(
+            self.client
+                .get_object(req)
+                .map(move |future| match future {
+                    Ok(out) => out.body.unwrap(),
+                    Err(RusotoError::Service(GetObjectError::NoSuchKey(key))) => {
+                        ByteStream::new(error_stream(Error::new(
+                            ErrorKind::NotFound,
+                            format!("not key {} not at bucket {}", key, bucket),
+                        )))
+                    }
+                    Err(e) => ByteStream::new(error_stream(Error::new(
+                        ErrorKind::Other,
+                        format!("failed to get object {}", e),
+                    ))),
+                })
+                .flatten_stream()
+                .into_async_read(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::io::AsyncReadExt;
     use rusoto_core::signature::SignedRequest;
     use rusoto_mock::MockRequestDispatcher;
 
@@ -205,10 +215,47 @@ mod tests {
             magic_contents.len() as u64,
         )
         .unwrap();
-        let mut reader = s.read("mykey").unwrap();
+        let mut reader = s.read("mykey");
         let mut buf = Vec::new();
-        let ret = futures::executor::block_on(reader.read_to_end(&mut buf));
+        let ret = block_on_with_tokio(reader.read_to_end(&mut buf));
         assert!(ret.unwrap() == 0);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    #[cfg(FALSE)]
+    // FIXME: enable this (or move this to an integration test) if we've got a
+    // reliable way to test s3 (rusoto_mock requires custom logic to verify the
+    // body stream which itself can have bug)
+    fn test_real_s3_storage() {
+        use std::f64::INFINITY;
+        use tikv_util::time::Limiter;
+
+        let mut s3 = Config::default();
+        s3.set_endpoint("http://127.0.0.1:9000".to_owned());
+        s3.set_bucket("bucket".to_owned());
+        s3.set_prefix("prefix".to_owned());
+        s3.set_access_key("93QZ01QRBYQQXC37XHZV".to_owned());
+        s3.set_secret_access_key("N2VcI4Emg0Nm7fDzGBMJvguHHUxLGpjfwt2y4+vJ".to_owned());
+        s3.set_force_path_style(true);
+
+        let limiter = Limiter::new(INFINITY);
+
+        let storage = S3Storage::new(&s3).unwrap();
+        const LEN: usize = READ_BUF_SIZE * 2;
+        static CONTENT: [u8; LEN] = [50_u8; LEN];
+        storage
+            .write(
+                "huge_file",
+                Box::new(limiter.limit(&CONTENT[..])),
+                LEN as u64,
+            )
+            .unwrap();
+
+        let mut reader = storage.read("huge_file");
+        let mut buf = Vec::new();
+        block_on_with_tokio(reader.read_to_end(&mut buf)).unwrap();
+        assert_eq!(buf.len(), LEN);
+        assert_eq!(buf.iter().position(|b| *b != 50_u8), None);
     }
 }
