@@ -122,11 +122,11 @@ impl SSTImporter {
         );
         match self.do_download::<E>(meta, backend, name, rewrite_rule, speed_limiter, sst_writer) {
             Ok(r) => {
-                info!("download"; "meta" => ?meta, "name" => name, "range" => ?r);
+                info!("74e709e9-9d22-44d3-8d80-f6b385194092 DOWNLOAD SUCCESS"; "meta" => ?meta, "name" => name, "range" => ?r);
                 Ok(r)
             }
             Err(e) => {
-                error!("download failed"; "meta" => ?meta, "name" => name, "err" => %e);
+                error!("74e709e9-9d22-44d3-8d80-f6b385194092 DOWNLOAD FAILED"; "meta" => ?meta, "name" => name, "err" => %e);
                 Err(e)
             }
         }
@@ -145,6 +145,13 @@ impl SSTImporter {
         let path = self.dir.join(meta)?;
         let url = url_of_backend(backend);
 
+        warn!("74e709e9-9d22-44d3-8d80-f6b385194092 BEFORE READ EXT STORAGE";
+            "meta" => ?meta,
+            "url" => %url,
+            "name" => name,
+            "speed_limiter" => ?&speed_limiter,
+        );
+
         // prepare to download the file from the external_storage
         let ext_storage = create_storage(backend)?;
         let ext_reader = ext_storage.read(name);
@@ -161,6 +168,12 @@ impl SSTImporter {
                 block_on_external_io(copy(ext_reader, &mut file_writer)).map_err(|e| {
                     Error::CannotReadExternalStorage(url.to_string(), name.to_owned(), e)
                 })?;
+            warn!("74e709e9-9d22-44d3-8d80-f6b385194092 AFTER READ EXT STORAGE";
+                "meta" => ?meta,
+                "url" => %url,
+                "name" => name,
+                "file_length" => file_length,
+            );
             if meta.length != 0 && meta.length != file_length {
                 let reason = format!(
                     "downloaded size {}, expected {}, local path {}",
@@ -189,7 +202,7 @@ impl SSTImporter {
         let sst_reader = RocksSstReader::open_with_env(path_str, Some(env))?;
         sst_reader.verify_checksum()?;
 
-        debug!("downloaded file and verified";
+        warn!("74e709e9-9d22-44d3-8d80-f6b385194092 downloaded file and verified";
             "meta" => ?meta,
             "url" => %url,
             "name" => name,

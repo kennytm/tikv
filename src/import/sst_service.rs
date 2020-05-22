@@ -184,7 +184,14 @@ impl<Router: RaftStoreRouter<RocksSnapshot>> ImportSst for ImportSSTService<Rout
             .build(self.importer.get_path(req.get_sst()).to_str().unwrap())
             .unwrap();
 
+        warn!("74e709e9-9d22-44d3-8d80-f6b385194092 RECEIVED DOWNLOAD REQUEST";
+            "req" => ?req,
+            "peer" => ctx.peer());
+
         ctx.spawn(self.threads.spawn_fn(move || {
+            warn!("74e709e9-9d22-44d3-8d80-f6b385194092 SPAWNED DOWNLOAD THREAD";
+                "req" => ?req);
+
             let res = importer.download::<RocksEngine>(
                 req.get_sst(),
                 req.get_storage_backend(),
@@ -196,7 +203,7 @@ impl<Router: RaftStoreRouter<RocksSnapshot>> ImportSst for ImportSSTService<Rout
 
             future::result(res)
                 .map_err(Error::from)
-                .then(|res| {
+                .then(move |res| {
                     let mut resp = DownloadResponse::default();
                     match res {
                         Ok(range) => {
@@ -208,6 +215,8 @@ impl<Router: RaftStoreRouter<RocksSnapshot>> ImportSst for ImportSSTService<Rout
                         }
                         Err(e) => resp.set_error(e.into()),
                     }
+                    warn!("74e709e9-9d22-44d3-8d80-f6b385194092 PREPARED DOWNLOAD RESPONSE";
+                        "resp" => ?resp);
                     Ok(resp)
                 })
                 .then(move |res| send_rpc_response!(res, sink, label, timer))
