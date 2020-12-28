@@ -9,8 +9,7 @@ use std::time::Instant;
 use futures::channel::mpsc::UnboundedSender;
 use futures::compat::Future01CompatExt;
 use futures::executor::block_on;
-use futures::future;
-use futures::future::TryFutureExt;
+use futures::future::{self, TryFuture, TryFutureExt};
 use futures::stream::Stream;
 use futures::stream::TryStreamExt;
 use futures::task::Context;
@@ -302,8 +301,19 @@ where
 }
 
 /// Do a request in synchronized fashion.
+#[track_caller]
 pub fn sync_request<F, R>(client: &LeaderClient, retry: usize, func: F) -> Result<R>
 where
+    F: Fn(&PdClientStub) -> GrpcResult<R>,
+{
+    block_on(async_request(client, retry, |client| {
+        Ok(future::ready(func(client)))
+    }))
+}
+
+pub async fn async_request<F, R>(client: &LeaderClient, retry: usize, func: F) -> Result<R::Ok>
+where
+    R: TryFuture<Error = grpcio::Error>,
     F: Fn(&PdClientStub) -> GrpcResult<R>,
 {
     let mut err = None;
@@ -313,7 +323,11 @@ where
             // which may hold the read lock and wait for PD client thread completing the request
             // and the PD client thread which may block on acquiring the write lock.
             let client_stub = client.inner.rl().client_stub.clone();
-            func(&client_stub).map_err(Error::Grpc)
+            match func(&client_stub) {
+                Ok(x) => x.into_future().await,
+                Err(e) => Err(e),
+            }
+            .map_err(Error::Grpc)
         };
         match ret {
             Ok(r) => {
@@ -321,7 +335,7 @@ where
             }
             Err(e) => {
                 error!(?e; "request failed");
-                if let Err(e) = block_on(client.reconnect()) {
+                if let Err(e) = client.reconnect().await {
                     error!(?e; "reconnect failed");
                 }
                 err.replace(e);
@@ -332,7 +346,7 @@ where
     Err(err.unwrap_or(box_err!("fail to request")))
 }
 
-pub fn validate_endpoints(
+pub async fn validate_endpoints(
     env: Arc<Environment>,
     cfg: &Config,
     security_mgr: Arc<SecurityManager>,
@@ -347,7 +361,7 @@ pub fn validate_endpoints(
             return Err(box_err!("duplicate PD endpoint {}", ep));
         }
 
-        let (_, resp) = match block_on(connect(Arc::clone(&env), &security_mgr, ep)) {
+        let (_, resp) = match connect(Arc::clone(&env), &security_mgr, ep).await {
             Ok(resp) => resp,
             // Ignore failed PD node.
             Err(e) => {
@@ -379,7 +393,7 @@ pub fn validate_endpoints(
     match members {
         Some(members) => {
             let (client, members) =
-                block_on(try_connect_leader(Arc::clone(&env), security_mgr, members))?;
+                try_connect_leader(Arc::clone(&env), security_mgr, members).await?;
             info!("all PD endpoints are consistent"; "endpoints" => ?cfg.endpoints);
             Ok((client, members))
         }

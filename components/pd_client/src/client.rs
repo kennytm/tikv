@@ -2,13 +2,12 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
 use futures::compat::Future01CompatExt;
 use futures::executor::block_on;
-use futures::future::{self, FutureExt};
+use futures::future::{self, BoxFuture, FutureExt};
 use futures::sink::SinkExt;
 use futures::stream::{StreamExt, TryStreamExt};
 
@@ -22,7 +21,9 @@ use tikv_util::{Either, HandyRwLock};
 use txn_types::TimeStamp;
 
 use super::metrics::*;
-use super::util::{check_resp_header, sync_request, validate_endpoints, LeaderClient};
+use super::util::{
+    async_request, check_resp_header, sync_request, validate_endpoints, LeaderClient,
+};
 use super::{Config, FeatureGate, PdFuture, UnixSecs};
 use super::{Error, PdClient, RegionInfo, RegionStat, Result, REQUEST_TIMEOUT};
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
@@ -37,6 +38,14 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(
+        cfg: &Config,
+        shared_env: Option<Arc<Environment>>,
+        security_mgr: Arc<SecurityManager>,
+    ) -> Result<RpcClient> {
+        block_on(Self::new_async(cfg, shared_env, security_mgr))
+    }
+
+    pub async fn new_async(
         cfg: &Config,
         shared_env: Option<Arc<Environment>>,
         security_mgr: Arc<SecurityManager>,
@@ -56,7 +65,7 @@ impl RpcClient {
             v => v.checked_add(1).unwrap_or(std::isize::MAX),
         };
         for i in 0..retries {
-            match validate_endpoints(Arc::clone(&env), cfg, security_mgr.clone()) {
+            match validate_endpoints(Arc::clone(&env), cfg, security_mgr.clone()).await {
                 Ok((client, members)) => {
                     let rpc_client = RpcClient {
                         cluster_id: members.get_header().get_cluster_id(),
@@ -98,6 +107,7 @@ impl RpcClient {
                         }
                     };
 
+                    // FIXME: RwLock may block the async executor.
                     rpc_client
                         .leader_client
                         .inner
@@ -111,7 +121,10 @@ impl RpcClient {
                     if i as usize % cfg.retry_log_every == 0 {
                         warn!("validate PD endpoints failed"; "err" => ?e);
                     }
-                    thread::sleep(cfg.retry_interval.0);
+                    let _ = GLOBAL_TIMER_HANDLE
+                        .delay(Instant::now() + cfg.retry_interval.0)
+                        .compat()
+                        .await;
                 }
             }
         }
@@ -142,7 +155,10 @@ impl RpcClient {
     }
 
     /// Gets given key's Region and Region's leader from PD.
-    fn get_region_and_leader(&self, key: &[u8]) -> Result<(metapb::Region, Option<metapb::Peer>)> {
+    async fn get_region_and_leader(
+        &self,
+        key: &[u8],
+    ) -> Result<(metapb::Region, Option<metapb::Peer>)> {
         let _timer = PD_REQUEST_HISTOGRAM_VEC
             .with_label_values(&["get_region"])
             .start_coarse_timer();
@@ -151,9 +167,10 @@ impl RpcClient {
         req.set_header(self.header());
         req.set_region_key(key.to_vec());
 
-        let mut resp = sync_request(&self.leader_client, LEADER_CHANGE_RETRY, |client| {
-            client.get_region_opt(&req, Self::call_option())
-        })?;
+        let mut resp = async_request(&self.leader_client, LEADER_CHANGE_RETRY, |client| {
+            client.get_region_async_opt(&req, Self::call_option())
+        })
+        .await?;
         check_resp_header(resp.get_header())?;
 
         let region = if resp.has_region() {
@@ -347,12 +364,24 @@ impl PdClient for RpcClient {
     }
 
     fn get_region(&self, key: &[u8]) -> Result<metapb::Region> {
-        self.get_region_and_leader(key).map(|x| x.0)
+        block_on(self.get_region_and_leader(key)).map(|x| x.0)
     }
 
     fn get_region_info(&self, key: &[u8]) -> Result<RegionInfo> {
-        self.get_region_and_leader(key)
-            .map(|x| RegionInfo::new(x.0, x.1))
+        block_on(self.get_region_and_leader(key)).map(|x| RegionInfo::new(x.0, x.1))
+    }
+
+    fn get_region_async<'k>(&'k self, key: &'k [u8]) -> BoxFuture<'k, Result<metapb::Region>> {
+        async move { self.get_region_and_leader(key).await.map(|x| x.0) }.boxed()
+    }
+
+    fn get_region_info_async<'k>(&'k self, key: &'k [u8]) -> BoxFuture<'k, Result<RegionInfo>> {
+        async move {
+            self.get_region_and_leader(key)
+                .await
+                .map(|x| RegionInfo::new(x.0, x.1))
+        }
+        .boxed()
     }
 
     fn get_region_by_id(&self, region_id: u64) -> PdFuture<Option<metapb::Region>> {
@@ -697,25 +726,31 @@ impl PdClient for RpcClient {
     }
 
     fn get_store_stats(&self, store_id: u64) -> Result<pdpb::StoreStats> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .with_label_values(&["get_store"])
-            .start_coarse_timer();
+        block_on(self.get_store_async(store_id))
+    }
 
-        let mut req = pdpb::GetStoreRequest::default();
-        req.set_header(self.header());
-        req.set_store_id(store_id);
+    fn get_store_stats_async(&self, store_id: u64) -> BoxFuture<'_, Result<pdpb::StoreStats>> {
+        async {
+            let _timer = PD_REQUEST_HISTOGRAM_VEC
+                .with_label_values(&["get_store"])
+                .start_coarse_timer();
 
-        let mut resp = sync_request(&self.leader_client, LEADER_CHANGE_RETRY, |client| {
-            client.get_store_opt(&req, Self::call_option())
-        })?;
-        check_resp_header(resp.get_header())?;
+            let mut req = pdpb::GetStoreRequest::default();
+            req.set_header(self.header());
+            req.set_store_id(store_id);
 
-        let store = resp.get_store();
-        if store.get_state() != metapb::StoreState::Tombstone {
-            Ok(resp.take_stats())
-        } else {
-            Err(Error::StoreTombstone(format!("{:?}", store)))
-        }
+            let mut resp = async_request(&self.leader_client, LEADER_CHANGE_RETRY, |client| {
+                client.get_store_async_opt(&req, Self::call_option())
+            }).await?;
+            check_resp_header(resp.get_header())?;
+
+            let store = resp.get_store();
+            if store.get_state() != metapb::StoreState::Tombstone {
+                Ok(resp.take_stats())
+            } else {
+                Err(Error::StoreTombstone(format!("{:?}", store)))
+            }
+        }.boxed()
     }
 
     fn get_operator(&self, region_id: u64) -> Result<pdpb::GetOperatorResponse> {
