@@ -322,10 +322,11 @@ impl ExternalSstFileInfo for RocksExternalSstFileInfo {
 }
 
 // Zlib and bzip2 are too slow.
-const COMPRESSION_PRIORITY: [DBCompressionType; 3] = [
+const COMPRESSION_PRIORITY: [DBCompressionType; 4] = [
     DBCompressionType::Lz4,
     DBCompressionType::Snappy,
     DBCompressionType::Zstd,
+    DBCompressionType::No,
 ];
 
 fn get_fastest_supported_compression_type() -> DBCompressionType {
@@ -341,6 +342,7 @@ fn fmt_db_compression_type(ct: DBCompressionType) -> &'static str {
         DBCompressionType::Lz4 => "lz4",
         DBCompressionType::Snappy => "snappy",
         DBCompressionType::Zstd => "zstd",
+        DBCompressionType::No => "no",
         _ => unreachable!(),
     }
 }
@@ -350,6 +352,7 @@ fn to_rocks_compression_type(ct: SstCompressionType) -> DBCompressionType {
         SstCompressionType::Lz4 => DBCompressionType::Lz4,
         SstCompressionType::Snappy => DBCompressionType::Snappy,
         SstCompressionType::Zstd => DBCompressionType::Zstd,
+        SstCompressionType::No => DBCompressionType::No,
     }
 }
 
@@ -358,6 +361,7 @@ pub fn from_rocks_compression_type(ct: DBCompressionType) -> Option<SstCompressi
         DBCompressionType::Lz4 => Some(SstCompressionType::Lz4),
         DBCompressionType::Snappy => Some(SstCompressionType::Snappy),
         DBCompressionType::Zstd => Some(SstCompressionType::Zstd),
+        DBCompressionType::No => Some(SstCompressionType::No),
         _ => None,
     }
 }

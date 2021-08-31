@@ -179,6 +179,7 @@ impl BackupWriter {
         limiter: Limiter,
         sst_max_size: u64,
     ) -> Result<BackupWriter> {
+        let compression_type = Some(SstCompressionType::No);
         let default = RocksSstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(CF_DEFAULT)

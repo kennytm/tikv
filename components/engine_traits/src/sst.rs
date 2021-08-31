@@ -55,6 +55,7 @@ pub enum SstCompressionType {
     Lz4,
     Snappy,
     Zstd,
+    No,
 }
 
 /// A builder builds a SstWriter.
